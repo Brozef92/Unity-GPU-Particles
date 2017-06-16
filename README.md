@@ -10,3 +10,5 @@ long beyond a depth of 5.
 
 
 ![](https://github.com/Brozef92/Unity-GPU-Particles/blob/master/gif_1.gif)
+![](https://github.com/Brozef92/Unity-GPU-Particles/blob/master/gif_2.gif)
+![](https://github.com/Brozef92/Unity-GPU-Particles/blob/master/gif_3.gif)
