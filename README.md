@@ -7,3 +7,6 @@ For maximum tree depth it may take between 1-2 minutes to complete.
 
 Collision accuracy really depends on number of nodes and tree depth, but the octree creation can take extremely
 long beyond a depth of 5.
+
+
+![](https://github.com/Brozef92/Unity-GPU-Particles/gif_1.gif)
