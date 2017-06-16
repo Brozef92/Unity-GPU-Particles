@@ -1,0 +1,299 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CS_Initialize
+#pragma kernel CS_Emit
+#pragma kernel CS_Update
+
+// Used parts of these... Thank you for making it public
+// https://github.com/hecomi/UnityPseudoInstancedGPUParticles/blob/master/Assets/Screen%20Space%20Collision%20GPU%20Particles/Compute%20Shaders/PseudoInstancedGPUParticleUpdater.compute
+// https://github.com/keijiro/KvantSpray
+
+// Particle's data
+#include "./GPUParticle.cginc"
+#include "./Random.cginc"
+
+//========================================================================================================
+//Buffers
+//========================================================================================================
+
+// Particle's data shared with CPU
+RWStructuredBuffer<Particle> particleBuffer; //All our particles
+//GPU only accessable memory...
+AppendStructuredBuffer<uint> deadParticles; //All "dead" indicies
+ConsumeStructuredBuffer<uint> particlePool; //All active indicies
+
+//A sparse Octree of SDF nodes packed into an array
+//Traverse using Indicies 
+StructuredBuffer<SDF> SDF_Buffer; 
+
+//========================================================================================================
+//Global Varriables CPU writable
+//========================================================================================================
+
+float ParticleLifeTime;
+float deltaTime;
+float InvParticleMass;
+
+float3 _EmitterPos;
+float3 _EmitterSize;
+float4 _EmitterDirection; //Normalized forward vector.xyz, spread.w
+
+float _ParticleSpeed;
+float _SpeedRandomness;
+float _ParticleBounce;
+
+float _ParticleRadius; //size of the particle taken from the Shader that will draw the particles
+
+int Octree_Size;
+int Octree_Depth;
+
+//Gravity -9.81f
+const float3 _Gravity;
+
+float CollisionThreshold;
+
+#define THREAD_COUNT 256
+
+//========================================================================================================
+//Helper Functions for collision detection: using Signed Distance Fields
+//========================================================================================================
+//basically this is an octree of a static environment and at the lowest nodes there is a Vector3
+//that is the closest surface point to the center of this Node, so it approximates geometry of the scene
+//the more nodes you have the more accurate the approximations are.
+
+bool Intersect(AABB A, float3 P)
+{
+	//http://www.miguelcasillas.com/?p=24
+	if (P.x > A.Min.x && P.x < A.Max.x &&
+		P.y > A.Min.y && P.y < A.Max.y &&
+		P.z > A.Min.z && P.z < A.Max.z)
+	{
+		return true;
+	}
+
+	return false;
+}
+
+//traverse through the tree and find Which node this Particle is in
+int FindNode(float3 P)
+{
+	int index = -1; //return this
+
+	int parent = 0; //which parent index are we using
+
+	//First check if this Particle is even with in the tree
+	AABB root;
+	root.Min = SDF_Buffer[0].Min;
+	root.Max = SDF_Buffer[0].Max;
+
+	bool inTree = Intersect(root, P);
+
+	if (!inTree)
+	{
+		return -1; //early out
+	}
+
+	//Check from this node until you find which Leaf Node this particle is in
+
+	for (int child = 0; child < 8; ++child) 
+	{
+		index = SDF_Buffer[parent].children[child];
+	
+		AABB node;
+		node.Min = SDF_Buffer[index].Min;
+		node.Max = SDF_Buffer[index].Max;
+	
+		bool inNode = Intersect(node, P);
+	
+		if (inNode == false)
+		{
+			continue; //not in this child check the next
+		}
+		else
+		{
+			//check if intersecting node has children to search
+			if (SDF_Buffer[index].children[0] != -1)
+			{
+				parent = index;
+				child = -1;
+				continue;
+			}
+			else
+			{
+				break; //this node the Particle is in is a leaf node
+			}
+		}
+	}
+	return index;
+}
+
+//search tree linearly...This was the old way and was slow as fuck 
+//when there were more than 500,000 particles
+int FindNode_Linear(float3 P)
+{
+	int index = -1; //return this
+
+	//First check if this Particle is even with in the tree
+	AABB root;
+	root.Min = SDF_Buffer[0].Min;
+	root.Max = SDF_Buffer[0].Max;
+
+	bool inTree = Intersect(root, P);
+
+	if (!inTree)
+	{
+		return -1; //early out
+	}
+
+	for (index = 0; index < Octree_Size; ++index)
+	{
+		AABB node;
+		node.Min = SDF_Buffer[index].Min;
+		node.Max = SDF_Buffer[index].Max;
+
+		bool inNode = Intersect(node, P);
+
+		if (inNode == false)
+		{
+			continue; //not in this child check the next
+		}
+		else if(inNode && SDF_Buffer[index].children[0] == -1)
+		{
+			break;
+		}
+	}
+	return index;
+}
+
+//========================================================================================================
+//All Kernels : Init(), Emit(), Update()
+//========================================================================================================
+
+//Initialize all Particles at the start of a handler script(C#)
+[numthreads(THREAD_COUNT, 1, 1)] //X * Y * Z threads
+void CS_Initialize(uint3 id : SV_DispatchThreadID)
+{
+	particleBuffer[id.x].active = false;
+	particleBuffer[id.x].invMass = InvParticleMass;
+	particleBuffer[id.x].position = (float3)0.0f;
+	deadParticles.Append(id.x); //Add all particle indicies to our dead list
+}
+
+//Emits particles after they "Die"
+[numthreads(THREAD_COUNT, 1, 1)] //X * Y * Z threads
+void CS_Emit()
+{
+	uint id = particlePool.Consume(); //take an index from the active particles
+
+	//seed for random functions
+	float2 seed = float2(id + 1, id + 2);
+	float3 randomRange = nrand3(seed);
+	float3 randomVelocity = nrand3(seed + 1);
+	float3 randomPosition = nrand3(seed + 2);
+	
+	//Spawn a particle
+	Particle p = particleBuffer[id];
+	p.active = true;
+
+	//re-position offset from emitter position
+	p.position = (randomPosition - (float3)0.5f) * _EmitterSize + _EmitterPos;
+
+	//re-velocitize?
+	float3 vel = (randomVelocity - (float3)0.5f) * 2.0f;
+	// Spreading
+	vel = lerp(_EmitterDirection.xyz, vel, _EmitterDirection.w);
+
+	vel = normalize(vel) * _ParticleSpeed;
+	vel *= 1.0f - nrand(seed, 1) * _SpeedRandomness;
+	p.velocity = vel;
+
+	//Acceleration is constant just Gravity
+	p.acceleration = _Gravity * p.invMass;
+
+	p.lifeTime = ParticleLifeTime;
+
+	//Assign our new particle
+	particleBuffer[id] = p;
+}
+
+
+//Updates each particle to move and/or collide
+[numthreads(THREAD_COUNT, 1, 1)] //X * Y * Z threads
+void CS_Update (uint3 id : SV_DispatchThreadID)
+{
+	Particle p = particleBuffer[id.x];
+	
+	if (p.active) 
+	{
+		p.lifeTime -= deltaTime;
+
+		if (p.lifeTime <= 0.0f)
+		{
+			// particle is "dead" ... GEO shader will not draw it
+			p.active = false;
+			p.position = (float3)0.0f;
+			deadParticles.Append(id.x); 
+		}
+		else
+		{
+			//Simple explicit Euler integration
+			p.velocity += p.acceleration * deltaTime;
+			p.position += p.velocity * deltaTime;
+
+			//Particle-Scene collision detection... using "Signed Distance Fields"
+			if (Octree_Size > 1)
+			{
+				//Find which leaf node this Particle is in
+				int index = FindNode(p.position); 
+				//int index = FindNode_Linear(p.position); //old way slow as fuck
+
+				if (index >= 0 && index < Octree_Size)
+				{
+					SDF node = SDF_Buffer[index];
+					//now use the Surface Point to find out just how close the Particle is
+					//to the nearest surface
+					
+					float3 pToS = node.Point - p.position;
+					float distSq = pToS.x*pToS.x + pToS.y*pToS.y + pToS.z*pToS.z;
+					distSq += _ParticleRadius * _ParticleRadius; //add the rough size of the particle
+					
+					if (distSq <= CollisionThreshold + (_ParticleRadius * _ParticleRadius))
+					{
+						//Reflect particle velocity by the surface Normal
+						float ns = (node.Max.x - node.Min.x) * 0.5f;
+						float3 nodeCenter = float3(node.Min.x + ns, node.Min.y + ns, node.Min.z + ns);
+						float3 surfaceNormal = normalize(node.Point - nodeCenter);
+						float3 vel = p.velocity;
+
+						//only reflect if the Reflect Vector is with-in some range
+						if (dot(vel, surfaceNormal) > -0.25f)
+						{
+							//Reflection formula: https://math.stackexchange.com/questions/13261/how-to-get-a-reflection-vector
+							p.velocity = vel - (2.0f*((dot(vel, surfaceNormal)*surfaceNormal)) * _ParticleBounce); //works well but doesn't lose much velocity after hit
+						}
+
+					}
+
+				}
+				//if particle is outside the Volume just reverse it's velocity
+				else if (index < 0)
+				{
+					//check if they are below the floor of the Octree Tree if so then reduce and negate velocity
+					float floor = 0.0f - ((SDF_Buffer[0].Max.y - SDF_Buffer[0].Min.y) * 0.5f);
+
+					if (p.position.y < floor)
+					{
+						p.position.y = floor + 0.01f;
+						p.velocity = -(p.velocity * 0.5f);
+					}
+					else
+					{
+						//p.velocity = -p.velocity * _ParticleBounce;
+					}
+				}
+			}
+		}
+	}
+
+	//re-apply to our particle buffer
+	particleBuffer[id.x] = p;
+}
